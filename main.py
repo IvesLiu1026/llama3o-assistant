@@ -3,14 +3,19 @@ from dotenv import load_dotenv
 from groq import Groq
 from PIL import ImageGrab, Image
 from openai import OpenAI
+from faster_whisper import WhisperModel
+import speech_recognition as sr
 import google.generativeai as genai
 import pyperclip
 import cv2
 import time
 import pyaudio
+import re
 
 load_dotenv()
 
+
+wake_word = 'Jarvis'
 groq_client = Groq(api_key=os.getenv('GROQ_API_KEY'))
 genai.configure(api_key=os.getenv('GEMINI_API_KEY'))
 openai_client = OpenAI(api_key=os.getenv('OPENAI_API_KEY'))
@@ -79,6 +84,19 @@ model = genai.GenerativeModel('gemini-1.5-flash-latest',
                               # safety_settings=safety_settings
 )
 
+num_cores = os.cpu_count()
+whisper_size = 'base'
+whisper_model = WhisperModel(
+    whisper_size,
+    device='cpu',
+    compute_type='int8',
+    cpu_threads=num_cores // 2,
+    num_workers=num_cores // 2
+)
+
+r = sr.Recognizer()
+source = sr.Microphone()
+
 def groq_prompt(prompt, img_context):
     if img_context:
         prompt = f'USER PROMPT: {prompt}\n\n  IMAGE CONTEXT: {img_context}'
@@ -111,7 +129,7 @@ def function_call(prompt):
     return response.content
 
 def take_screeshot():
-    path = 'screenshot.jpg'
+    path = 'photos/screenshot.jpg'
     screenshot = ImageGrab.grab()
     rgb_scr = screenshot.convert('RGB')
     rgb_scr.save(path, quality=15) # quality set as 15 to reduce file size and make it faster to upload
@@ -120,7 +138,7 @@ def web_cam_capture():
     if not web_cam.isOpened():
         print('Error: Could not open webcam')
         return
-    path = 'webcam_capture.jpg'
+    path = 'photos/webcam_capture.jpg'
     time.sleep(2)  # Add delay for initialization
     ret, frame = web_cam.read()
     if not ret:
@@ -156,7 +174,7 @@ def speak(text):
     
     with openai_client.audio.speech.with_streaming_response.create(
         model='tts-1',
-        voice='onyx',
+        voice='nova',
         response_format='pcm',
         input=text,
     ) as response:
@@ -168,27 +186,60 @@ def speak(text):
                 if max(chunk) > silenece_threshold:
                     player_stream.write(chunk)
                     stream_start = True
+
+def wave_to_text(audio_path):
+    segments, _ = whisper_model.transcribe(audio_path)
+    text = ''.join(segment.text for segment in segments)
+    return text
+
+def callback(recognizer, audio):
+    prompt_audio_path = 'prompt.wav'
+    with open(prompt_audio_path, 'wb') as f:
+        f.write(audio.get_wav_data())
     
-while True:
-    prompt = input('USER: ')
-    call = function_call(prompt)
+    prompt_text = wave_to_text(prompt_audio_path)
+    clean_prompt = extract_prompt(prompt_text, wake_word)
     
-    if 'take_screenshot' in call:
-        print('Screenshot taken')
-        take_screeshot()
-        visual_context = vision_prompt(prompt, 'screenshot.jpg')
-    elif 'capture_webcam' in call:
-        print('Webcam capture taken')
-        web_cam_capture()
-        visual_context = vision_prompt(prompt, 'webcam_capture.jpg')
-    elif 'extract_clipboard' in call:
-        print('Clipboard extracted')
-        paste = extract_clipboard()
-        prompt = f'{prompt}\n\n CLIPBOARD CONTENT: {paste}'
-        visual_context = None
+    if clean_prompt:
+        print(f'USER: {clean_prompt}')
+        call = function_call(clean_prompt)
+        if 'take_screenshot' in call:
+            print('Screenshot taken')
+            take_screeshot()
+            visual_context = vision_prompt(clean_prompt, 'photos/screenshot.jpg')
+        elif 'capture_webcam' in call:
+            print('Webcam capture taken')
+            web_cam_capture()
+            visual_context = vision_prompt(clean_prompt, 'photos/webcam_capture.jpg')
+        elif 'extract_clipboard' in call:
+            print('Clipboard extracted')
+            paste = extract_clipboard()
+            clean_prompt = f'{clean_prompt}\n\n CLIPBOARD CONTENT: {paste}'
+            visual_context = None
+        else:
+            visual_context = None
+            
+        response = groq_prompt(prompt=clean_prompt, img_context=visual_context)
+        print(f'ASSISTANT: {response}')
+        speak(response)
+
+def start_listening():
+    with source as s:
+        r.adjust_for_ambient_noise(s, duration=2)
+    print('\nSay', wake_word, 'followed with your prompt, \n')
+    r.listen_in_background(source, callback)
+    
+    while True:
+        time.sleep(.5)
+
+def extract_prompt(transcribed_text, wake_word):
+    pattern = rf'\b{re.escape(wake_word)}[\s,.?!]*([A-Za-z0-9].*)'
+    match = re.search(pattern, transcribed_text, re.IGNORECASE)
+    
+    if match:
+        prompt = match.group(1).strip()
+        return prompt
     else:
-        visual_context = None
-        
-    response = groq_prompt(prompt=prompt, img_context=visual_context)
-    print(response)
-    # speak(response)
+        return None
+
+start_listening()
